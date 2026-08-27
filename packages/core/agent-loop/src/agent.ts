@@ -16,7 +16,7 @@ import type {
   RequestErrorAction,
 } from '@deepseek-ai/dsh-agent'
 import { Inbox, agentEvents, assembleContextFor } from '@deepseek-ai/dsh-agent'
-import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall, ToolCallBlock } from '@deepseek-ai/dsh-llm'
 import {
   BlockAssembler,
   LlmError,
@@ -350,7 +350,7 @@ export class ReactLoopAgent implements Agent {
         step,
         assembly.tools,
         system,
-        this.session.deriveMessages(),
+        sanitizeToolPairing(this.session.deriveMessages()),
         startsRequestSeries,
         surfaceGeneration,
         signal,
@@ -539,5 +539,83 @@ export class ReactLoopAgent implements Agent {
       signal,
     }))
     return { request, ...preparedCall === undefined ? {} : { preparedCall } }
+  }
+}
+
+/**
+ * Strip tool-calls from assistant messages that the provider would reject,
+ * so a derived history can never reach the LLM adapter with a dangling or
+ * malformed call. Two defect classes are removed:
+ *
+ * 1. Orphaned calls — no tool-result in the conversation carries their id.
+ *    Compaction's count-based tool-pairing balance can miss reference
+ *    mismatches (equal counts but mismatched callIds), leaving orphaned
+ *    tool-calls that the provider rejects with a 400 ("insufficient tool
+ *    messages following tool_calls message").
+ * 2. Malformed calls — an empty id, an empty name, or non-JSON arguments
+ *    (e.g. a truncated stream produced a half-written call). These would
+ *    also be rejected on the wire.
+ *
+ * This is a defensive boundary fix — the session log is not mutated; only
+ * the derived message array passed to the LLM adapter is sanitized.
+ * Unusable tool-calls are stripped; orphaned tool-results are kept (they
+ * are tolerated by providers as extra tool messages).
+ * @param messages - the derived message history.
+ * @returns a copy with unusable tool-calls removed from assistant messages.
+ */
+export function sanitizeToolPairing(messages: readonly Message[]): Message[] {
+  const answeredIds = new Set<string>()
+  for (const message of messages) {
+    if (message.role === 'user') {
+      for (const block of message.content) {
+        if (block.type === 'tool-result') answeredIds.add(block.toolCallId)
+      }
+    }
+  }
+  let dirty = false
+  const result: Message[] = []
+  for (const message of messages) {
+    if (message.role === 'assistant') {
+      const kept = message.content.filter(
+        block => block.type !== 'tool-call' || isUsableToolCall(block, answeredIds),
+      )
+      if (kept.length !== message.content.length) {
+        dirty = true
+        const dropped = message.content.filter(
+          (block): block is ToolCallBlock => block.type === 'tool-call' && !isUsableToolCall(block, answeredIds),
+        )
+        console.warn(
+          `[dsh-agent-loop] stripping ${dropped.length} unusable tool-call(s) `
+          + 'from assistant message (orphaned, empty id/name, or malformed arguments): '
+          + dropped.map(block => block.id).join(', '),
+        )
+        result.push({ ...message, content: kept })
+        continue
+      }
+    }
+    result.push(message)
+  }
+  return dirty ? result : [...messages]
+}
+
+/** Whether a tool-call block is safe to send to the provider. */
+function isUsableToolCall(
+  block: ToolCallBlock,
+  answeredIds: ReadonlySet<string>,
+): boolean {
+  return answeredIds.has(block.id)
+    && block.id !== ''
+    && block.name.trim() !== ''
+    && isWellFormedArguments(block.arguments)
+}
+
+/** A raw JSON arguments string is well-formed when blank (a no-arg call) or parseable. */
+function isWellFormedArguments(args: string): boolean {
+  if (args.trim().length === 0) return true
+  try {
+    JSON.parse(args)
+    return true
+  } catch {
+    return false
   }
 }
