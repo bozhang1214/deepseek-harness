@@ -328,7 +328,7 @@ describe('mapUsage', () => {
 })
 
 describe('translate: defensive tool-call branches', () => {
-  it('handles deltas that never carry id or name (empty-string fallbacks)', async () => {
+  it('handles deltas that never carry id or name (synthesized-id fallback)', async () => {
     const chunks = await collect(translate(feed(
       firstChunk,
       // Hypothetical lenient wire: argument fragments with no id/name at all.
@@ -338,8 +338,8 @@ describe('translate: defensive tool-call branches', () => {
     )))
     expect(chunks).toEqual([
       { type: 'block-start', index: 0, blockType: 'tool-call' },
-      { type: 'tool-call-delta', index: 0, id: '', argumentsDelta: '{}' },
-      { type: 'block-end', index: 0, block: { type: 'tool-call', id: '', name: '', arguments: '{}' } },
+      { type: 'tool-call-delta', index: 0, id: 'call-0', argumentsDelta: '{}' },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call-0', name: '', arguments: '{}' } },
       { type: 'finish', reason: { kind: 'tool-calls' } },
     ])
   })

@@ -77,7 +77,11 @@ function closeBlock(block: OpenBlock): ContentBlock {
     case 'reasoning': return { type: 'reasoning', text: block.text }
     case 'tool-call': return {
       type: 'tool-call',
-      id: ToolCallId(block.callId ?? ''),
+      // A provider that never sends an id gets a deterministic synthesized id
+      // (matching BlockAssembler's `call-${index}` fallback) instead of an
+      // empty-string id, so a malformed call can never pair with an unrelated
+      // empty-id result later.
+      id: ToolCallId(block.callId ?? `call-${block.index}`),
       name: block.name ?? '',
       arguments: block.text,
     }
@@ -172,7 +176,7 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
         yield {
           type: 'tool-call-delta',
           index: block.index,
-          id: ToolCallId(block.callId ?? ''),
+          id: ToolCallId(block.callId ?? `call-${block.index}`),
           ...block.name !== undefined ? { name: block.name } : {},
           argumentsDelta: fragment,
         }
