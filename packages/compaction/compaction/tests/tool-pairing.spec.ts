@@ -421,4 +421,31 @@ describe('tool-pairing corrupt surfaces', () => {
     } as unknown as Session
     expect(() => toolPairingBalancedBefore(mismatched, mismatchedSeq)).toThrow(/no matching session event/)
   })
+
+  it('throws for a result referencing a different id than the open call (reference mismatch)', () => {
+    const session = Session.create(SessionId('mismatched-ids'))
+    session.append('assistant/message', {
+      turn: 1,
+      step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'tool-call', id: CallId('c1'), name: 'bash', arguments: '{}' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'mock' },
+        },
+      }),
+    }, SURFACE)
+    session.append('tool/result', {
+      turn: 1, step: 1,
+      message: createToolResultMessage({
+        callId: CallId('c2'),
+        content: [],
+        isError: false,
+      }),
+    }, SURFACE)
+    // A count-only balance would see +1 then -1 and call this balanced; the
+    // call-id balance must reject the mismatched reference.
+    expect(() => toolPairingBalancedAfter(session, session.surface.nodes[1]!)).toThrow(/no matching tool-call/)
+  })
 })

@@ -19,21 +19,41 @@ interface BalanceCache {
   cutBalanced: readonly boolean[]
   /** Current surface position of each event seq, indexing {@link cutBalanced}. */
   indexBySeq: Map<number, number>
-  /** In-progress tool-call count after the processed surface tail. */
-  inProgressToolCalls: number
+  /**
+   * Unanswered tool-calls after the processed surface tail, keyed by call id
+   * with a per-id pending count (parallel calls may defensively reuse an id).
+   */
+  inProgressCallIds: Map<string, number>
 }
 
 const balanceCacheBySession = new WeakMap<Session, BalanceCache>()
 
-/** Return how one surface event changes the in-progress tool-call count. */
-function eventDelta(event: SessionEvent): number {
+/**
+ * Apply one surface event to the unanswered call-id map. Call ids (not counts)
+ * are the balance unit, so a result referencing a different id than the open
+ * call — the reference mismatch a count-only balance misses — is rejected.
+ */
+function foldEvent(pending: Map<string, number>, event: SessionEvent): void {
   switch (event.type) {
     case 'assistant/message':
-      return event.data.message.content.filter(block => block.type === 'tool-call').length
-    case 'tool/result':
-      return -1
+      for (const block of event.data.message.content) {
+        if (block.type === 'tool-call') {
+          pending.set(block.id, (pending.get(block.id) ?? 0) + 1)
+        }
+      }
+      return
+    case 'tool/result': {
+      const callId = event.data.message.source.callId
+      const count = pending.get(callId)
+      if (count === undefined) {
+        throw new Error(`tool-pairing balance: tool/result at surface seq ${event.seq} has no matching tool-call (corrupt surface)`)
+      }
+      if (count === 1) pending.delete(callId)
+      else pending.set(callId, count - 1)
+      return
+    }
     default:
-      return 0
+      return
   }
 }
 
@@ -58,18 +78,15 @@ function extendCache(
   // append cannot leave a partially advanced state behind.
   const events = session.events
   const pendingCuts: boolean[] = []
-  let inProgressToolCalls = cache.inProgressToolCalls
+  const inProgressCallIds = new Map(cache.inProgressCallIds)
   for (const seq of tail) {
-    inProgressToolCalls += eventDelta(eventForSeq(events, seq))
-    if (inProgressToolCalls < 0) {
-      throw new Error(`tool-pairing balance: tool/result at surface seq ${seq} has no matching tool-call (corrupt surface)`)
-    }
-    pendingCuts.push(inProgressToolCalls === 0)
+    foldEvent(inProgressCallIds, eventForSeq(events, seq))
+    pendingCuts.push(inProgressCallIds.size === 0)
   }
 
   tail.forEach((seq, offset) => cache.indexBySeq.set(seq, processed + offset))
   cache.cutBalanced = cache.cutBalanced.concat(pendingCuts)
-  cache.inProgressToolCalls = inProgressToolCalls
+  cache.inProgressCallIds = inProgressCallIds
   return cache
 }
 
@@ -87,7 +104,7 @@ function balanceCache(session: Session): BalanceCache {
       generation,
       cutBalanced: [true],
       indexBySeq: new Map(),
-      inProgressToolCalls: 0,
+      inProgressCallIds: new Map(),
     }, seqs)
     balanceCacheBySession.set(session, rebuilt)
     return rebuilt
