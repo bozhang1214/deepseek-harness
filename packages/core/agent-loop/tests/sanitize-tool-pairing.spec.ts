@@ -5,12 +5,12 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { CallId, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import { sanitizeToolPairing } from '../src/agent.ts'
 
 function toolCall(id: string, name = 'bash', args = '{}'): ContentBlock {
-  return { type: 'tool-call', id: CallId(id), name, arguments: args }
+  return { type: 'tool-call', id: ToolCallId(id), name, arguments: args }
 }
 
 function assistant(content: ContentBlock[]): Message {
@@ -22,7 +22,7 @@ function assistant(content: ContentBlock[]): Message {
 
 function toolResult(callId: string, text = 'ok'): Message {
   return createToolResultMessage({
-    callId: CallId(callId),
+    callId: ToolCallId(callId),
     content: [{ type: 'text', text }],
     isError: false,
   })

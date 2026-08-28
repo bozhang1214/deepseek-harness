@@ -429,7 +429,7 @@ describe('tool-pairing corrupt surfaces', () => {
       step: 1,
       message: createMessage({
         role: 'assistant',
-        content: [{ type: 'tool-call', id: CallId('c1'), name: 'bash', arguments: '{}' }],
+        content: [{ type: 'tool-call', id: ToolCallId('c1'), name: 'bash', arguments: '{}' }],
         source: {
           kind: 'model',
           ...{ provider: 'mock', model: 'mock' },
@@ -439,7 +439,7 @@ describe('tool-pairing corrupt surfaces', () => {
     session.append('tool/result', {
       turn: 1, step: 1,
       message: createToolResultMessage({
-        callId: CallId('c2'),
+        callId: ToolCallId('c2'),
         content: [],
         isError: false,
       }),
