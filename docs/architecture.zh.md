@@ -110,6 +110,8 @@ turn/end
 
 **模型可见即已记录。** 抵达模型请求的一切都必须能从日志重建，并由一项运行时不变量断言这一点。因此，新增一项模型可见输入就需要新增一个会话事件：扩展 `SessionEventMap` 并从日志渲染。
 
+**投影 seam。** `dsh-session-projection` 提供 `ctx.sessionProjections`：已注册单元增量折叠已提交事件，host 消费方通过 `stateOf()` 读取单个类型化状态，载体通过 `snapshot()` 批量取得裁剪后的客户端视图。host 读取方要么在激活时要求该服务，要么在注册表或必需 key 缺席时明确失败。贡献方可以保留 `ctx.inject(['sessionProjections'], ...)` 注册，但不能为缺失的 host 值静默提供默认值。agent loop 为读取方注册共享的 `turnBoundary` 状态（[决策](../.agents/notes/implemented/architecture/2026-08-19-session-projection-mandatory-seam.zh.md)）。
+
 ## 能力 seam
 
 一个 **seam** 是一项可替换能力，包含三种角色：声明接口的 **Service Definition**、实现它的 **Service Provider**，以及使用它的 **Consumer**（通常是面向模型的工具）。一个包可以合并承担多个角色，但单一角色本身不是 seam；添加一项能力意味着把三者一并设计（[能力图](capability-seams.zh.md)）。
@@ -141,7 +143,8 @@ seam 正是替换一个提供方就能改变整个产品的原因。文件系统
 | 添加持久会话状态 | 扩展 `SessionEventMap`；从日志渲染和回放 |
 | 生成会话标题 | 注册唯一的 `ctx.sessionTitle` 提供方 |
 | 管理同会话目标 | 使用 `ctx.goals`；通过 `agent/*` 续跑 |
-| fork 活跃会话 | `ctx.sessions.fork(source, boundary?, childSessionId?)` |
+| 在轮次边界 fork 会话 | `ctx.agents.create({ sessionId, seed, meta: { parentSession, seedLength } })`——只有经 agent-loop 发布的会话才会持久化 |
+| 在新后端存储会话 | 基于共享的句柄脚手架实现 `SessionPersistence`（`create`/`open`/`stat`/`list`/`export`） |
 | 将注册项限定到单个 agent | 使用该 agent 的 `agent.ctx` |
 
 [扩展实操手册](cookbook/extension-cookbook.zh.md)将功能映射到能力，并索引[包](cookbook/adding-a-package.zh.md)、[工具](cookbook/adding-a-tool.zh.md)、[LLM（大语言模型）适配器](cookbook/adding-an-llm-adapter.zh.md)和[设置卡片](cookbook/adding-a-settings-card.zh.md)的分步指南。[Conversation 子系统](subsystems/conversation.zh.md)负责 Chat node 组装。

@@ -5,10 +5,9 @@ import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { agentPresetProjectionDefinition } from '@deepseek-ai/dsh-agent-presets'
-import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionLogOffset, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import type { SessionObservation } from '@deepseek-ai/dsh-session-query'
-import { TypertLookupFailure } from '@deepseek-ai/dsh-typert-protocol'
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
@@ -48,6 +47,7 @@ function header(id: string, cwd: string | null = '/workspace'): SessionHeader {
     version: 0,
     id: SessionId(id),
     createdAt: 1,
+    isSeeded: false,
     ...(cwd === null ? {} : { cwd }),
   }
 }
@@ -87,12 +87,16 @@ describe('ApiSession identity failures', () => {
       .rejects.toBeInstanceOf(ApiSessionNotFound)
 
     const inspect = vi.fn(() => Promise.resolve(undefined))
+    const stat = vi.fn(() => Promise.resolve(undefined))
     const disposeMissing = providePersistence(ctx, {
       list: () => Promise.resolve([]),
+      stat,
       inspect,
     })
     await expect(inspectApiSession(ctx, SessionId('missing'))).rejects.toBeInstanceOf(ApiSessionNotFound)
-    expect(inspect).toHaveBeenCalledOnce()
+    // Absence is decided by the stat preflight; the log itself is never opened.
+    expect(stat).toHaveBeenCalledOnce()
+    expect(inspect).not.toHaveBeenCalled()
     disposeMissing()
 
     const listed = header('cwd-less-catalog', null)
@@ -118,11 +122,14 @@ describe('ApiSession identity failures', () => {
     await ctx.plugin(SessionStore)
     installSessionReadTestServices(ctx)
     const meta = header('signalled-inspection')
-    const inspect = vi.fn(() => Promise.resolve({ meta, events: [] }))
-    providePersistence(ctx, { inspect })
+    const inspect = vi.fn(() => Promise.resolve({ meta, inheritedEventCount: SessionLogOffset(0), events: [] }))
+    providePersistence(ctx, {
+      list: () => Promise.resolve([meta]),
+      inspect,
+    })
     const signal = new AbortController().signal
 
-    await expect(inspectApiSession(ctx, meta.id, signal)).resolves.toEqual({ meta, events: [] })
+    await expect(inspectApiSession(ctx, meta.id, signal)).resolves.toEqual({ meta, inheritedEventCount: SessionLogOffset(0), events: [] })
     expect(inspect).toHaveBeenCalledWith(meta.id, signal)
   })
 })
@@ -154,7 +161,7 @@ describe('ApiSession Agent lookup and recovery', () => {
       header: header('observed-without-cwd', null),
     } as SessionObservation
     await expect(agents.resolveObservedAgent(invalid)).resolves.toMatchObject({
-      error: { code: 'session-not-found' },
+      error: { code: 'session/not-found' },
     })
   })
 
@@ -170,7 +177,7 @@ describe('ApiSession Agent lookup and recovery', () => {
     if (host === undefined) throw new Error('Agent Context resolver was not registered')
 
     await expect(host.resolve(live.id)).resolves.toBe(live.ctx)
-    await expect(host.resolve(SessionId('missing'))).rejects.toBeInstanceOf(TypertLookupFailure)
+    await expect(host.resolve(SessionId('missing'))).rejects.toMatchObject({ code: 'session/not-found' })
   })
 
   it('returns raced ordinary Agents and ownership failures after resume throws', async () => {
@@ -200,7 +207,7 @@ describe('ApiSession Agent lookup and recovery', () => {
       throw new Error('raced child publication')
     })
     await expect(child.agents.resolveAgent(childMeta.id)).resolves.toMatchObject({
-      error: { code: 'agent-busy' },
+      error: { code: 'session/agent-busy' },
     })
   })
 
@@ -211,7 +218,7 @@ describe('ApiSession Agent lookup and recovery', () => {
       inspect: vi.fn(),
     })
     await expect(missing.agents.resolveAgent(SessionId('missing'))).resolves.toMatchObject({
-      error: { code: 'session-not-found' },
+      error: { code: 'session/not-found' },
     })
 
     const failed = await harness()
@@ -222,7 +229,7 @@ describe('ApiSession Agent lookup and recovery', () => {
     })
     vi.spyOn(failed.ctx.agents, 'resume').mockRejectedValue(new Error('factory unavailable'))
     await expect(failed.agents.resolveAgent(meta.id)).resolves.toMatchObject({
-      error: { code: 'internal', message: expect.stringContaining('factory unavailable') as string },
+      error: { code: 'gateway/internal', message: expect.stringContaining('factory unavailable') as string },
     })
   })
 
@@ -378,7 +385,13 @@ describe('ApiSession create or adoption', () => {
     } as never)
     const resumed = {
       id: meta.id,
-      session: { id: meta.id, header: meta, events },
+      session: {
+        id: meta.id,
+        header: meta,
+        snapshotEvents: () => events,
+        eventAt: (seq: number) => events[seq],
+        seq: events.length,
+      },
       status: 'idle',
       ctx,
     } as unknown as Agent
@@ -408,7 +421,7 @@ describe('ApiSession create or adoption', () => {
       mount: () => Promise.resolve(),
     } as never)
     await expect(child.agents.resolveAgent(childMeta.id)).resolves.toMatchObject({
-      error: { code: 'agent-busy' },
+      error: { code: 'session/agent-busy' },
     })
 
     const conflict = await harness()

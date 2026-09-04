@@ -1,14 +1,14 @@
 /** Cold-safe Session list and search projection. */
 
-import { stat } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent-presets'
 import type { ImageAttachmentLimits } from '@deepseek-ai/dsh-attachment'
+import { SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-session-projection-cache'
 import { SessionQueryError, type SessionSearchCursor } from '@deepseek-ai/dsh-session-query'
-import { TypertRemoteFailure } from '@deepseek-ai/dsh-typert-protocol'
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import { z } from 'zod'
 import {
   SESSION_SEARCH_RESULT_LIMIT,
@@ -19,8 +19,19 @@ import type {
   SessionSearchValue, SessionSummary,
 } from './types.ts'
 
-/** Default maximum artifact size eligible for one cold projection observation. */
+/** Default maximum stat-reported event count eligible for one cold projection observation. */
+export const DEFAULT_COLD_BLANK_PROBE_MAX_EVENTS = 16
+
+/** Default maximum stat-reported artifact size eligible for one cold projection observation. */
 export const DEFAULT_COLD_BLANK_PROBE_MAX_BYTES = 1024
+
+/** Resolved cold-blank probe policy: each threshold gates its stat metric; `0` disables that gate. */
+export interface ColdBlankProbePolicy {
+  /** Maximum stat-reported `eventCount` eligible for a full observation. */
+  readonly coldBlankProbeMaxEvents: number
+  /** Maximum stat-reported `sizeBytes` eligible for a full observation. */
+  readonly coldBlankProbeMaxBytes: number
+}
 
 const COLD_SUMMARY_BATCH_SIZE = 16
 const SEARCH_PROVIDER_CALL_LIMIT = 100
@@ -81,31 +92,29 @@ export function truncateUnicodeCodePoints(value: string, maximum: number): strin
 export class ApiSessionList {
   /**
    * @param ctx - Host context carrying Session, query, persistence, and projection services.
-   * @param coldBlankProbeMaxBytes - maximum physical artifact size eligible for a full observation.
+   * @param probe - stat-metadata thresholds gating a full cold observation.
    */
   constructor(
     private readonly ctx: Context,
-    private readonly coldBlankProbeMaxBytes: number,
+    private readonly probe: ColdBlankProbePolicy,
   ) {
-    ctx.inject(['sessionProjections'], (projectionCtx) => {
-      projectionCtx.sessionProjections.register<'sessionListMetadata', SessionListMetadata>({
-        key: 'sessionListMetadata',
-        stateSchema: sessionListMetadataSchema,
-        init: () => ({ blank: true, lastPromptAt: null }),
-        apply: applySessionListMetadata,
-        wire: { viewSchema: sessionListMetadataSchema, view: state => state },
-        stateVersion: 1,
-      })
+    ctx.sessionProjections.register<'sessionListMetadata', SessionListMetadata>({
+      key: 'sessionListMetadata',
+      stateSchema: sessionListMetadataSchema,
+      init: () => ({ blank: true, lastPromptAt: null }),
+      apply: applySessionListMetadata,
+      wire: { viewSchema: sessionListMetadataSchema, view: state => state },
+      stateVersion: 1,
     })
-    ctx.inject(['sessionProjections', 'attachments'], (projectionCtx) => {
-      projectionCtx.sessionProjections.register<'imageLimits', null>({
+    ctx.inject(['attachments'], (attachmentCtx) => {
+      ctx.sessionProjections.register<'imageLimits', null>({
         key: 'imageLimits',
         stateSchema: z.null(),
         init: () => null,
         apply: state => state,
         wire: {
           viewSchema: imageLimitsSchema,
-          view: () => projectionCtx.attachments.imageLimits,
+          view: () => attachmentCtx.attachments.imageLimits,
         },
         stateVersion: 1,
       })
@@ -177,7 +186,7 @@ export class ApiSessionList {
       sessionId: header.id,
       updatedAt: updatedAt(header, metadata),
       running: false,
-      // A large or inaccessible cache miss remains unknown and visible.
+      // A large, metadata-less, or inaccessible cache miss remains unknown and visible.
       blank: metadata?.blank ?? false,
       ...listFields(header),
       ...(projections === undefined ? {} : { projections }),
@@ -188,15 +197,30 @@ export class ApiSessionList {
     header: SessionHeader,
     signal: AbortSignal | undefined,
   ): Promise<SessionProjectionHints | undefined> {
-    if (this.coldBlankProbeMaxBytes === 0) return undefined
+    const { coldBlankProbeMaxEvents, coldBlankProbeMaxBytes } = this.probe
+    if (coldBlankProbeMaxEvents === 0 && coldBlankProbeMaxBytes === 0) return undefined
     const persistence = this.ctx.get('sessionPersistence')
-    const location = persistence?.locate(header)
-    if (location === undefined) return undefined
+    if (persistence === undefined) return undefined
     signal?.throwIfAborted()
+    let snapshot: Awaited<ReturnType<typeof persistence.stat>>
     try {
-      if ((await stat(location.path)).size > this.coldBlankProbeMaxBytes) return undefined
-    } catch {
+      snapshot = await persistence.stat(header.id, signal === undefined ? {} : { signal })
+    } catch (error: unknown) {
+      // An unreadable single session degrades to unknown state instead of
+      // failing the whole list request.
       signal?.throwIfAborted()
+      this.ctx.logger.warn(
+        `api-session.list: cold stat for "${header.id}" failed; serving it as visible: ${String(error)}`,
+      )
+      return undefined
+    }
+    if (snapshot === undefined) return undefined
+    if (snapshot.eventCount !== undefined) {
+      if (coldBlankProbeMaxEvents === 0 || snapshot.eventCount > coldBlankProbeMaxEvents) return undefined
+    } else if (snapshot.sizeBytes !== undefined) {
+      if (coldBlankProbeMaxBytes === 0 || snapshot.sizeBytes > coldBlankProbeMaxBytes) return undefined
+    } else {
+      // The backend offers no cheap size hint, so a full observation is unbounded work.
       return undefined
     }
     try {
@@ -228,8 +252,8 @@ export class ApiSessionList {
     signal.throwIfAborted()
     const provider = this.ctx.get('sessionQuery')
     if (provider === undefined) {
-      reject(
-        'internal',
+      throw new RemoteError(
+        'gateway/internal',
         'session search is unavailable: this deployment does not mount @deepseek-ai/dsh-session-query',
         {},
       )
@@ -319,9 +343,9 @@ export class ApiSessionList {
     } catch (error: unknown) {
       signal.throwIfAborted()
       if (error instanceof SessionQueryError && error.code === 'SESSION_QUERY_ABORTED') {
-        reject('cancelled', 'session search was aborted', {})
+        throw new RemoteError('gateway/cancelled', 'session search was aborted', {})
       }
-      reject('internal', `session search failed: ${String(error)}`, {})
+      throw new RemoteError('gateway/internal', `session search failed: ${String(error)}`, {})
     }
   }
 
@@ -331,8 +355,10 @@ export class ApiSessionList {
   ): SessionProjectionHints | undefined {
     try {
       const block = session === undefined
-        ? this.ctx.get('sessionProjectionCache')?.cachedSnapshot(header)
-        : this.ctx.get('sessionProjections')?.cachedSnapshot(session)
+        ? header.isSeeded
+          ? undefined
+          : this.ctx.get('sessionProjectionCache')?.cachedSnapshot(header, SessionLogOffset(0))
+        : this.ctx.sessionProjections.cachedSnapshot(session)
       return block !== undefined && Object.keys(block.values).length > 0
         ? {
           asOfSeq: block.asOfSeq,
@@ -353,23 +379,19 @@ export class ApiSessionList {
 function normalizeSearchQuery(query: string): string {
   const normalized = query.trim()
   if (normalized.length === 0) {
-    reject('bad-request', 'session search query must not be empty', {})
+    throw new RemoteError('gateway/bad-request', 'session search query must not be empty', {})
   }
   if (normalized.length > SESSION_SEARCH_QUERY_MAX_CHARS) {
-    reject(
-      'bad-request',
+    throw new RemoteError(
+      'gateway/bad-request',
       `session search query must contain at most ${SESSION_SEARCH_QUERY_MAX_CHARS} UTF-16 code units`,
       {},
     )
   }
   if (normalized.includes('\0')) {
-    reject('bad-request', 'session search query must not contain NUL', {})
+    throw new RemoteError('gateway/bad-request', 'session search query must not contain NUL', {})
   }
   return normalized
-}
-
-function reject(code: string, message: string, details: object): never {
-  throw new TypertRemoteFailure({ code, message, details })
 }
 
 function updatedAt(header: SessionHeader, metadata: SessionListMetadata | undefined): number {
