@@ -220,6 +220,23 @@ describe('Messages request conversion', () => {
     } })
     expect(() => body([message, result()])).toThrow(/historical tool input is invalid JSON/)
   })
+
+  it('drops legacy reasoning content in user and tool-result turns instead of failing the request', () => {
+    // Settlement notices persisted before `fix(subagent): keep settlement notices
+    // text-only` (2026-09-14) inlined the child's reasoning blocks into the
+    // parent's user message. chat-completions drops them while flattening, so
+    // Messages must agree on identical durable history rather than fail closed.
+    const notice = createMessage({
+      role: 'user',
+      source: { kind: 'user' },
+      content: [{ type: 'text', text: 'Its closing message:' }, { type: 'reasoning', text: 'child thinking' }],
+    })
+    expect(body([notice]).messages).toEqual([
+      { role: 'user', content: [{ type: 'text', text: 'Its closing message:' }] },
+    ])
+    expect(body([user(), assistant([call()]), result('a', [{ type: 'text', text: 'out' }, { type: 'reasoning', text: 'stale' }])]).messages[2]?.content)
+      .toEqual([{ type: 'tool_result', tool_use_id: 'a', content: [{ type: 'text', text: 'out' }], is_error: false }])
+  })
 })
 
 describe('validated configuration', () => {
@@ -296,7 +313,7 @@ describe('Messages images', () => {
     await expect(prepareImages([assistant([image])], connection, model, attachments, access, signal)).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTENT' })
     expect(() => body([result('a', [image])])).toThrow(/image/)
     expect(() => body([assistant([image])])).toThrow(/assistant/)
-    expect(() => body([result('a', [{ type: 'reasoning', text: 'bad' }])])).toThrow(/user/)
+    expect(() => body([createMessage({ role: 'user', source: { kind: 'user' }, content: [call()] })])).toThrow(/user/)
     expect(() => serialize(options({ model }), connection, [result('a', [image])], new Map([[ref.attachmentId, version]]), access, undefined, new Map()))
       .toThrow(/request file id is missing/)
   })

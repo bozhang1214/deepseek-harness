@@ -56,6 +56,18 @@ export function serialize(
   const inHistory = model?.systemPromptUpdate === 'in-history'
   const input = (blocks: readonly ContentBlock[]): WireInput[] => blocks.flatMap((block): WireInput[] => {
     if (block.type === 'text') return block.text ? [{ type: 'text', text: block.text }] : []
+    // A reasoning block carries no model-visible meaning in a user/tool-result
+    // turn, and chat-completions already drops it when flattening to text. History
+    // persisted before `fix(subagent): keep settlement notices text-only`
+    // (2026-09-14) inlined a background child's reasoning into its parent's
+    // settlement notice, so dropping it here keeps both protocols in agreement on
+    // identical durable history instead of failing every turn. Any other
+    // unrepresentable block still fails closed: a `file` attachment is real
+    // model-visible input, and discarding it would silently change the view.
+    if (block.type === 'reasoning') {
+      onReplayDegrade?.('discarded reasoning content from a user/tool-result turn')
+      return []
+    }
     if (block.type !== 'image') return unsupported(`user/tool-result content ${block.type}`)
     const version = images.get(block.attachment.attachmentId)
     if (version === undefined) throw new LlmError('DeepSeek Messages request image is missing', 'INVALID_REQUEST')
