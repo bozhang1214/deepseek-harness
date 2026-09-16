@@ -42,6 +42,15 @@ function parseSettingsNamespace(value: string): SettingsNamespace {
   return value as SettingsNamespace
 }
 
+/**
+ * Brand a raw string as a {@link SettingsNamespace}.
+ * @param value - candidate namespace; lowercase kebab-case, as in plugin short names.
+ * @returns the branded namespace.
+ * @deprecated Use {@link SettingsProvider.register} directly — it validates the namespace inline.
+ *   Re-exported here for binary compatibility with plugins compiled before the v0.1.5 service refactor.
+ */
+export const settingsNamespace: (value: string) => SettingsNamespace = parseSettingsNamespace
+
 /** When a namespace's changes take effect for its owner. */
 export type SettingsApplies = 'live' | 'restart'
 
