@@ -26,6 +26,7 @@ async function harness(
   id: string,
   seed?: readonly SessionEvent[],
   creation?: Omit<CreateSessionOptions, 'seed'>,
+  uploadConfig: { enabled?: boolean; maxBatchBytes?: number } = { enabled: true },
 ): Promise<{
   ctx: Context
   session: Session
@@ -35,7 +36,7 @@ async function harness(
   contexts.push(ctx)
   await ctx.plugin(SessionStore)
   await ctx.plugin(DeepSeekLlmApiExtensionRegistry)
-  const upload = ctx.plugin(SessionLogDeepSeek, { enabled: true })
+  const upload = ctx.plugin(SessionLogDeepSeek, uploadConfig)
   await upload
   const options = seed === undefined
     ? undefined
@@ -529,5 +530,70 @@ describe('incremental DeepSeek session-log upload', () => {
     await disposeUpload()
     expect((await ctx.deepseekLlmApiExtensions.prepare({ body: body(), signal: SIGNAL, sessionId: session.id })).fields)
       .not.toHaveProperty('dsh_session_log')
+  })
+
+  it('drains a backlog larger than the ceiling across successive requests without gaps or duplicates', async () => {
+    const maxBatchBytes = 4096
+    const { ctx, session } = await harness('bounded-drain', undefined, undefined, { enabled: true, maxBatchBytes })
+    // Each event serializes to slightly over 1 KiB, so one request cannot carry the backlog.
+    const appended: number[] = []
+    for (let step = 0; step < 24; step++) {
+      appended.push(Number(session.append('system/message', {
+        turn: 1,
+        step,
+        message: createSystemMessage('x'.repeat(1024), 'fixture'),
+      }, { surfaceOp: 'append' }).seq))
+    }
+    const tailSeq = Number(session.snapshotEvents().at(-1)?.seq)
+
+    const delivered: number[] = []
+    let firstRoundThrough: number | undefined
+    let firstRoundCarried = 0
+    for (let round = 0; round < 30; round++) {
+      const prepared = await ctx.deepseekLlmApiExtensions.prepare({ body: body(), signal: SIGNAL, sessionId: session.id })
+      const payload = prepared.fields.dsh_session_log
+      if (payload === undefined) break
+      const carried = payload.events
+      const bytes = carried.reduce((total, event) => total + Buffer.byteLength(JSON.stringify(event), 'utf8'), 0)
+      // Bounded, except that progress always admits the oldest pending event.
+      expect(bytes <= maxBatchBytes || carried.length === 1).toBe(true)
+      // The watermark names the last carried event, never the log tail.
+      expect(payload.throughSeq).toBe(carried.at(-1)?.seq)
+      // Contiguous: this batch resumes exactly after the accepted watermark.
+      expect(carried[0]?.seq).toBe(payload.afterSeq + 1)
+      if (firstRoundThrough === undefined) {
+        firstRoundThrough = payload.throughSeq
+        firstRoundCarried = carried.length
+      }
+      for (const event of carried) delivered.push(event.seq)
+      await prepared.accept()
+    }
+
+    // The first request carried only a prefix and did not mark the tail accepted.
+    expect(firstRoundCarried).toBeLessThan(appended.length)
+    expect(firstRoundThrough).toBeLessThan(tailSeq)
+    // Exactly 0..n-1: no session event was skipped, repeated, or delivered out of order.
+    expect(delivered).toEqual([...delivered.keys()])
+    for (const seq of appended) expect(delivered).toContain(seq)
+  })
+
+  it('admits a single event above the ceiling so the watermark still advances', async () => {
+    const { ctx, session } = await harness('oversized-single', undefined, undefined, { enabled: true, maxBatchBytes: 64 })
+    const oversized = session.append('system/message', {
+      turn: 1,
+      step: 1,
+      message: createSystemMessage('y'.repeat(4096), 'fixture'),
+    }, { surfaceOp: 'append' })
+
+    const prepared = await ctx.deepseekLlmApiExtensions.prepare({ body: body(), signal: SIGNAL, sessionId: session.id })
+    const payload = prepared.fields.dsh_session_log
+    // The record is kept alone rather than dropped: a withheld event would freeze the watermark forever.
+    expect(payload?.events).toHaveLength(1)
+    expect(payload?.throughSeq).toBe(Number(oversized.seq))
+    await prepared.accept()
+    expect(SessionLogDeepSeek.acceptedThrough(session)).toBe(Number(oversized.seq))
+    // The next request resumes past it instead of resending it forever.
+    const next = await ctx.deepseekLlmApiExtensions.prepare({ body: body(), signal: SIGNAL, sessionId: session.id })
+    expect(next.fields.dsh_session_log?.afterSeq).toBe(Number(oversized.seq))
   })
 })

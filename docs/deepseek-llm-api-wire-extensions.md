@@ -110,7 +110,7 @@ An enabled inventory with no qualifying entries sends `packages: []`; disabling 
 | `throughSeq` | non-negative integer | Greatest sequence represented by this request |
 | `events` | array | Contiguous events from `afterSeq + 1` through `throughSeq` |
 
-The first upload uses `afterSeq: -1` and carries the complete current log. Each later upload starts after the greatest accepted watermark for the same Session id. The sender snapshots the event array once per request; appends after that snapshot belong to a later request.
+The first upload uses `afterSeq: -1` and begins at the start of the current log. Each later upload starts after the greatest accepted watermark for the same Session id. One request admits only an oldest-first prefix of the pending suffix — bounded by the contributing plugin's `maxBatchBytes`, 4 MiB by default — and reports that prefix's last sequence as `throughSeq`, so a backlog larger than the bound drains across successive requests while every sequence is still delivered in order. The sender snapshots the event array once per request; appends after that snapshot belong to a later request.
 
 ### Wire Session header
 

@@ -28,13 +28,16 @@ kind: "package-reference"
 | 配置键 | 默认值 | 含义 |
 |---|---:|---|
 | `enabled` | `true` | 注册 `dsh_session_log` 贡献。将其设为 `false` 可停止会话日志上传。 |
+| `maxBatchBytes` | `4194304`（4 MiB） | 单次请求 `events` 成员序列化后总大小的上限（含边界值），不含数组自身的标点。 |
 
 随附 profile 会挂载该插件，因此默认配置会注册请求字段并追加接受水位；overlay 可用 `enabled: false` 选择退出。
+
+`maxBatchBytes` 约束的是单次请求，而不是整个会话。待发后缀超过该上限时会跨多次请求分批排空，每次被接受的请求排空一批，因此长生命周期会话无需把整份积压塞进一个请求体。这一点很关键：提供方拒绝超大请求体时不会返回接受，所以在此上限存在之前，只要积压超过提供方的请求上限，该会话就永久无法恢复上传——每次重试都会重建同样被拒的请求体。单条事件若自身超过上限仍会被单独送达（扣下它会让水位卡在它之前），因此该上限是目标值，对单条超大记录并不构成硬保证。
 
 <a id="request-field"></a>
 ## 请求字段
 
-对于携带存活 `sessionId` 的请求，插件会折叠该确切会话格式代的最大已接受水位，对 `Session.events` 取快照，并发送水位之后的连续后缀。进程内 fold 会让每条事件只被扫描一次并增量消费后续追加；重启与 HMR（热模块替换）会从持久日志重建它。版本 1 字段包含 `sessionFormatVersion`、原始会话 header（仅 seeded Session 携带 `seedLength`）、数值型 `afterSeq` 与 `throughSeq`，以及每个已转换为原始数值 envelope 字段的完整规范事件。只有记录的会话 id 与格式代均匹配请求来源时水位才生效，因此 fork 会话会忽略从父会话继承的水位。表层事件必须携带 `surfaceOp`，替换范围使用数值型 `startSeq` 与 `endSeq`；仅 system、user 与 tool 事件可以携带 `sourceEventSeqs`。assistant 的提供方元数据保留在内嵌流中，只出现在日志中的事件不携带这两个元数据字段。
+对于携带存活 `sessionId` 的请求，插件会折叠该确切会话格式代的最大已接受水位，对 `Session.events` 取快照，并发送水位之后连续后缀中按最旧优先、累计不超过 `maxBatchBytes` 的一批。进程内 fold 会让每条事件只被扫描一次并增量消费后续追加；重启与 HMR（热模块替换）会从持久日志重建它。版本 1 字段包含 `sessionFormatVersion`、原始会话 header（仅 seeded Session 携带 `seedLength`）、数值型 `afterSeq` 与 `throughSeq`，以及该批次内每个已转换为原始数值 envelope 字段的规范事件。`throughSeq` 表示该请求实际携带的最后一条序列，而绝非日志尾部，因此未被接纳的剩余部分不会被记为已接受，下一次请求会从其后一条序列继续。只有记录的会话 id 与格式代均匹配请求来源时水位才生效，因此 fork 会话会忽略从父会话继承的水位。表层事件必须携带 `surfaceOp`，替换范围使用数值型 `startSeq` 与 `endSeq`；仅 system、user 与 tool 事件可以携带 `sourceEventSeqs`。assistant 的提供方元数据保留在内嵌流中，只出现在日志中的事件不携带这两个元数据字段。
 
 <a id="acceptance-and-retry"></a>
 ## 接受与重试
@@ -68,7 +71,7 @@ DeepSeek 适配器会在 HTTP 2xx 后、消费 SSE（Server-Sent Events）正文
 
 - **崩溃窗口重复**——2xx 后、接受水位持久化前进程终止，会在恢复时触发保守重放。
 - **缺少存活会话就没有字段**——直接调用或陈旧会话调用没有可供快照的规范日志；显式缺失语义仍暂缓处理。
-- **没有独立请求大小上限**——完整交付采用 fail-closed 策略；提供方拒绝会保持游标不变，而非截断日志。
+- **限制的是批次而非总量**——`maxBatchBytes` 只约束单次请求，因此大积压会跨多次请求排空；但单条事件若超过该上限仍会单独送达，并仍可能以该大小被拒。交付保持 fail-closed：不会为适配上限而截断或丢弃任何事件。
 
 <a id="dev-note"></a>
 ### 开发备注

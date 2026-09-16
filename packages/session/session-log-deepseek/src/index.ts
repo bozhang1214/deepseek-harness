@@ -34,15 +34,36 @@ export const name = 'session-log-deepseek'
 /** Services required to resolve sessions and contribute the provider request field. */
 export const inject = ['deepseekLlmApiExtensions', 'sessions']
 
+/**
+ * Default ceiling on the summed serialized size of the `events` members one
+ * request contributes.
+ *
+ * Without a ceiling the first upload of a long-lived Session carries its entire
+ * backlog in one body. A Session whose log grows past the provider's request
+ * limit is then rejected with HTTP 413, and because a rejected request records
+ * no watermark, every later attempt resends the same oversized body: the
+ * Session can never be uploaded again. Bounding each request to a prefix turns
+ * that dead end into a backlog that drains over successive requests.
+ */
+export const DEFAULT_MAX_BATCH_BYTES = 4 * 1024 * 1024
+
 /** Session-log request contribution configuration. */
 export interface Config {
   /** Contribute `dsh_session_log` to official DeepSeek requests. Defaults to `true`. */
   enabled?: boolean
+  /**
+   * Inclusive ceiling on the summed serialized size of one request's `events`
+   * members, excluding the array's own punctuation. A larger pending suffix
+   * drains over successive requests, one bounded prefix per accepted request.
+   * @default DEFAULT_MAX_BATCH_BYTES
+   */
+  maxBatchBytes?: number
 }
 
 /** Validated Session-log request contribution configuration. */
 export const Config: z<Config> = z.object({
   enabled: z.boolean().default(true),
+  maxBatchBytes: z.number().step(1).min(1).default(DEFAULT_MAX_BATCH_BYTES),
 })
 
 interface AcceptanceFold {
@@ -110,6 +131,35 @@ function wireSurfaceOp(op: SurfaceOp): DeepSeekSessionLogWireSurfaceOp {
 }
 
 /**
+ * Oldest-first prefix of `events` whose serialized form stays within `maxBytes`.
+ *
+ * A prefix is what keeps the upload lossless: the watermark advances to the
+ * batch's last sequence and the next request resumes at the one after it, so
+ * nothing is skipped and every admitted sequence is eventually accepted.
+ *
+ * The first event is always admitted, even alone above the ceiling. Progress
+ * outranks the ceiling here: refusing an oversized record would freeze the
+ * watermark below it and strand every event behind it forever.
+ * @param events - wired events of the pending suffix, oldest first.
+ * @param maxBytes - inclusive serialized-byte ceiling for the returned prefix.
+ * @returns the admitted prefix; empty only when `events` is empty.
+ */
+function takeBatch(
+  events: readonly DeepSeekSessionLogWireEvent[],
+  maxBytes: number,
+): readonly DeepSeekSessionLogWireEvent[] {
+  const batch: DeepSeekSessionLogWireEvent[] = []
+  let bytes = 0
+  for (const event of events) {
+    const size = Buffer.byteLength(JSON.stringify(event), 'utf8')
+    if (batch.length > 0 && bytes + size > maxBytes) break
+    batch.push(event)
+    bytes += size
+  }
+  return batch
+}
+
+/**
  * Highest confirmed sequence for this exact Session format generation.
  * @param session - canonical log whose matching acceptance events are folded.
  * @returns greatest accepted sequence, or `-1` before any accepted request.
@@ -167,17 +217,23 @@ export function apply(ctx: Context, config: Config): void {
       const afterSeq = acceptedThrough(session)
       // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
       const snapshot = session.snapshotEvents()
-      const throughSeq = snapshot.at(-1)?.seq
-      if (throughSeq === undefined) return undefined
+      const tailSeq = snapshot.at(-1)?.seq
+      if (tailSeq === undefined) return undefined
       // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
       const suffix = session.snapshotEvents(SessionLogOffset(afterSeq + 1))
+      const events = takeBatch(suffix.map(wireEvent), config.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES)
+      // `throughSeq` must name the last sequence this request actually carries —
+      // never the log tail — or the remainder between the batch and the tail
+      // would be recorded as accepted without ever being uploaded. An empty
+      // suffix keeps the watermarked tail, preserving the field's drained shape.
+      const throughSeq = events.at(-1)?.seq ?? Number(tailSeq)
       const value: DeepSeekSessionLogExtension = {
         version: 1,
         sessionFormatVersion: session.header.version,
         session: wireHeader(session),
         afterSeq: Number(afterSeq),
-        throughSeq: Number(throughSeq),
-        events: suffix.map(wireEvent),
+        throughSeq,
+        events,
       }
       return {
         value,
@@ -185,7 +241,7 @@ export function apply(ctx: Context, config: Config): void {
           session.append('session-log-deepseek/delivery-accepted', {
             sessionId: session.id,
             sessionFormatVersion: session.header.version,
-            throughSeq,
+            throughSeq: SessionSeq(throughSeq),
           })
           // TODO: Add an immediate lightweight checkpoint if duplicate replay after a 2xx crash window becomes unacceptable.
         },

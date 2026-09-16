@@ -2028,10 +2028,17 @@ Requires: `deepseekLlmApiExtensions` · `sessions`
 export interface Config {
   /** Contribute `dsh_session_log` to official DeepSeek requests. Defaults to `true`. */
   enabled?: boolean
+  /**
+   * Inclusive ceiling on the summed serialized size of one request's `events`
+   * members, excluding the array's own punctuation. A larger pending suffix
+   * drains over successive requests, one bounded prefix per accepted request.
+   * @default DEFAULT_MAX_BATCH_BYTES
+   */
+  maxBatchBytes?: number
 }
 ```
 
-Source: [`packages/session/session-log-deepseek/src/index.ts:38`](../packages/session/session-log-deepseek/src/index.ts)
+Source: [`packages/session/session-log-deepseek/src/index.ts:51`](../packages/session/session-log-deepseek/src/index.ts)
 
 <a id="deepseek-aidsh-session-log-export"></a>
 
